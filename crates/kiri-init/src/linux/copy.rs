@@ -6,19 +6,22 @@
 //!
 //! A stopped container's root is mounted by the agent, not the child: the
 //! child asks for it over a socket pair of its own, so a copy and a start at
-//! the same moment share one mount (see `roots`, #227).
+//! the same moment share one mount (see `roots`, #227). The container's own
+//! mounts — named volumes, binds, tmpfs — go into that root in a namespace
+//! of the child's own, as a start puts them in its container's (#245).
 
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
-use kiri_proto::{COPY_PORT, CopySpec, FsEntry, Msg, copy_flags, copy_op};
+use kiri_proto::{COPY_PORT, CopySpec, FsEntry, Msg, StrList, copy_flags, copy_op};
 
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use super::container::Paths;
+use super::container::{self, Paths};
+use super::inroot;
 use super::sys;
 
 /// A copy child as the agent sees it: its end of the child's socket pair
@@ -207,8 +210,17 @@ fn job(sock: OwnedFd, chan: OwnedFd, running: &[(&str, libc::pid_t)], paths: &Pa
     }
 }
 
-/// Makes the container's root this process's `/`.
-fn enter(spec: &CopySpec<'_>, running: &[(&str, libc::pid_t)], paths: &Paths, chan: &OwnedFd) -> io::Result<()> {
+/// Makes the container's root this process's `/`, with the container's own
+/// mounts in place when it is not running: Docker's archive endpoint resolves
+/// a path through a container's mounts — a file in a named volume is read and
+/// written whether the container is created, running or stopped — and so does
+/// this one (#245).
+fn enter(
+    spec: &CopySpec<'_>,
+    running: &[(&str, libc::pid_t)],
+    paths: &Paths,
+    chan: &OwnedFd,
+) -> io::Result<()> {
     let root = match running.iter().find(|(id, _)| *id == spec.id) {
         // An export is the container's own filesystem, without its mounts:
         // the overlay the agent mounted for it.
@@ -234,7 +246,11 @@ fn enter(spec: &CopySpec<'_>, running: &[(&str, libc::pid_t)], paths: &Paths, ch
                 return Err(io::Error::new(io::ErrorKind::NotFound, "no such container"));
             }
             ask(chan, 'm', spec)?;
-            paths.containers.join(spec.id).join("rootfs")
+            let rootfs = paths.containers.join(spec.id).join("rootfs");
+            if sees_mounts(spec.op) {
+                mount_container_mounts(&rootfs, spec.mounts)?;
+            }
+            rootfs
         }
     };
     let c = sys::cstr(&root)?;
@@ -244,6 +260,31 @@ fn enter(spec: &CopySpec<'_>, running: &[(&str, libc::pid_t)], paths: &Paths, ch
         sys::check(libc::chdir(c"/".as_ptr()) as _, "chdir")?;
     }
     Ok(())
+}
+
+/// Whether a copy resolves its path through the container's own mounts.
+/// Every copy but an export does, as Docker's archive endpoint does: an
+/// export is the container's filesystem without them, as `docker export` is.
+fn sees_mounts(op: u8) -> bool {
+    op != copy_op::EXPORT
+}
+
+/// Puts a stopped container's mounts in its root, in a mount namespace of
+/// this child's own, as a start puts them in its container's. A path in a
+/// named volume, or under a bind, then resolves as the container sees it.
+fn mount_container_mounts(rootfs: &std::path::Path, mounts: StrList<'_>) -> io::Result<()> {
+    let mounts = container::copy_mounts(mounts)?;
+    if mounts.is_empty() {
+        return Ok(());
+    }
+    // The mounts belong to this copy alone: in the agent's namespace they
+    // would outlive it, and a second copy of the same container would see
+    // them.
+    // SAFETY: unshare with a valid flag.
+    sys::check(unsafe { libc::unshare(libc::CLONE_NEWNS) } as _, "unshare")?;
+    sys::remount(c"/", libc::MS_REC | libc::MS_PRIVATE)?;
+    let root = inroot::open_root(rootfs)?;
+    container::mount_for_copy(root.as_fd(), &mounts)
 }
 
 /// Asks the agent for the container's root (`m`: mounted, or shared with
@@ -598,6 +639,135 @@ mod tests {
         Chunks::new(&mut conn).read_to_end(&mut got).unwrap();
         assert_eq!(got, b"abcde");
         assert_eq!(conn, b"after");
+    }
+
+    /// Unmounts what a test mounted, however the test ends.
+    struct Unmount(std::path::PathBuf);
+
+    impl Drop for Unmount {
+        fn drop(&mut self) {
+            let Ok(t) = sys::cstr(&self.0) else { return };
+            // SAFETY: a valid NUL-terminated path, unmounting the test's own mount.
+            unsafe { libc::umount2(t.as_ptr(), libc::MNT_DETACH) };
+        }
+    }
+
+    /// A copy request as the daemon sends it, for the guest to decode.
+    fn copy_request(op: u8, path: &str, mounts: &[&str]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        kiri_proto::encode_copy(&mut wire, op, "c1", path, 0, &[] as &[&str], mounts);
+        wire
+    }
+
+    /// Every copy but an export resolves its path through the container's
+    /// mounts, as Docker's archive endpoint does; `docker export` is the
+    /// container's own filesystem without them.
+    #[test]
+    fn every_copy_but_an_export_resolves_through_the_containers_mounts() {
+        for op in [copy_op::IN, copy_op::OUT, copy_op::STAT] {
+            assert!(sees_mounts(op), "op {op}");
+        }
+        assert!(
+            !sees_mounts(copy_op::EXPORT),
+            "an export leaves the mounts out"
+        );
+    }
+
+    /// A tmpfs goes away with the container, so a copy finds the image's own
+    /// directory there, as Docker's archive endpoint does.
+    #[test]
+    fn a_copy_leaves_a_tmpfs_out() {
+        let wire = copy_request(copy_op::OUT, "/tmp", &["/nonexistent\t/tmp\tcreate,tmpfs"]);
+        let Ok(Msg::Copy(spec)) = kiri_proto::decode(&wire) else {
+            panic!()
+        };
+        let mounts = container::copy_mounts(spec.mounts).unwrap();
+        assert!(mounts.is_empty(), "a tmpfs is not part of a copy");
+    }
+
+    /// The issue's own case (#245): a created, never-started container whose
+    /// file is in a named volume. Its root gets the volume, so the file reads
+    /// and a write lands in the volume (a copy in and a copy out share
+    /// `enter`). Needs root to mount, as the guest has.
+    #[test]
+    fn a_stopped_containers_volume_is_readable_and_writable() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root to mount");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("kiri-cp-volume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (rootfs, volume) = (base.join("rootfs"), base.join("volumes/pg/_data"));
+        std::fs::create_dir_all(rootfs.join("data")).unwrap();
+        std::fs::create_dir_all(rootfs.join("etc")).unwrap();
+        std::fs::create_dir_all(&volume).unwrap();
+        // The image's own file where the volume is mounted, one outside it,
+        // and the file the volume already holds.
+        std::fs::write(rootfs.join("data/PG_VERSION"), b"image\n").unwrap();
+        std::fs::write(rootfs.join("etc/os-release"), b"alpine\n").unwrap();
+        std::fs::write(volume.join("PG_VERSION"), b"17\n").unwrap();
+        let undo = Unmount(rootfs.join("data"));
+
+        let line = format!("{}\t/data\tcreate,copyup", volume.display());
+        let wire = copy_request(copy_op::OUT, "/data/PG_VERSION", &[line.as_str()]);
+        let Ok(Msg::Copy(spec)) = kiri_proto::decode(&wire) else {
+            panic!()
+        };
+        let mounts = container::copy_mounts(spec.mounts).unwrap();
+        let root = inroot::open_root(&rootfs).unwrap();
+        if let Err(e) = container::mount_for_copy(root.as_fd(), &mounts) {
+            eprintln!("skipped: cannot mount here: {e}");
+            drop(undo);
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        // Read through the root, as the copy sees it after its chroot.
+        assert_eq!(
+            std::fs::read(rootfs.join("data/PG_VERSION")).unwrap(),
+            b"17\n",
+            "the volume's file, not the image's"
+        );
+        // Written through the root, it is the volume's file that changes.
+        std::fs::write(rootfs.join("data/written"), b"in").unwrap();
+        assert_eq!(std::fs::read(volume.join("written")).unwrap(), b"in");
+        // A path outside the volume is the container's own, as before.
+        assert_eq!(
+            std::fs::read(rootfs.join("etc/os-release")).unwrap(),
+            b"alpine\n"
+        );
+        // A copy never fills a volume from the image: what the container put
+        // there is all it holds.
+        let mut names: Vec<String> = std::fs::read_dir(&volume)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["PG_VERSION", "written"]);
+
+        drop(undo);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A container with no mounts, and a request from a daemon that sends
+    /// none, enter the root exactly as before: nothing is mounted, and no
+    /// mount namespace is made.
+    #[test]
+    fn a_copy_with_no_mounts_leaves_the_root_alone() {
+        let base = std::env::temp_dir().join(format!("kiri-cp-nomounts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("data")).unwrap();
+        std::fs::write(base.join("data/PG_VERSION"), b"image\n").unwrap();
+        let wire = copy_request(copy_op::OUT, "/data/PG_VERSION", &[]);
+        let Ok(Msg::Copy(spec)) = kiri_proto::decode(&wire) else {
+            panic!()
+        };
+        mount_container_mounts(&base, spec.mounts).unwrap();
+        assert_eq!(
+            std::fs::read(base.join("data/PG_VERSION")).unwrap(),
+            b"image\n"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
