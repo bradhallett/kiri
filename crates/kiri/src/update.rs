@@ -62,7 +62,7 @@ pub fn newer(candidate: &str, current: &str) -> bool {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+    let mut cfg = ureq::Agent::config_builder()
         .timeout_connect(Some(std::time::Duration::from_secs(10)))
         .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")))
         // The system's roots merged with webpki's, like the registry client
@@ -73,9 +73,14 @@ fn agent() -> ureq::Agent {
                     kiri_image::roots::root_certs().into(),
                 ))
                 .build(),
-        )
-        .build()
-        .into()
+        );
+    // Downloads must reach the feed the same way the registry and tools
+    // agents do: through Kiri's proxy settings (Settings → Network).
+    let e = crate::daemon::proxy::effective();
+    if let Some(p) = e.https.or(e.http).and_then(|u| ureq::Proxy::new(&u).ok()) {
+        cfg = cfg.proxy(Some(p));
+    }
+    cfg.build().into()
 }
 
 pub fn latest() -> io::Result<Release> {
