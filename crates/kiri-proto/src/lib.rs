@@ -247,6 +247,11 @@ pub mod copy_flags {
     /// Intel Mac with macOS 14 passes a half-close on as a full one, and the
     /// guest's answer fails with EPIPE.
     pub const CHUNKED: u32 = 4;
+    /// The container runs with `--read-only`: a copy-in onto its root, where
+    /// no mount holds the destination, is refused (moby's
+    /// `checkWritablePath`). Older daemons never send it, so an old guest
+    /// ignores it.
+    pub const READONLY_ROOTFS: u32 = 8;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

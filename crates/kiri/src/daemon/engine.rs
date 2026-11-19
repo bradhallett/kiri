@@ -3310,7 +3310,7 @@ impl Engine {
         key: &str,
         op: u8,
         path: &str,
-        flags: u32,
+        mut flags: u32,
     ) -> Result<kiri_vmm::VsockStream, Error> {
         self.wait_for_start(&self.resolve(key)?);
         // Looked up after the wait: a `--rm` start that failed meanwhile has
@@ -3320,6 +3320,11 @@ impl Engine {
             let st = self.lock();
             let id = resolve(&st, key)?;
             let c = st.containers.get(&id);
+            // A `--read-only` container refuses a copy onto its root, the
+            // guest checks it with the mounts (moby's `checkWritablePath`).
+            if c.is_some_and(|c| c.spec.readonly_rootfs) {
+                flags |= kiri_proto::copy_flags::READONLY_ROOTFS;
+            }
             let layers = c.map(|c| c.layers.clone()).unwrap_or_default();
             // Its mounts as a start would put them in, so a path under a
             // named volume or a bind resolves as Docker's archive endpoint
